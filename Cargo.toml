@@ -24,7 +24,7 @@ helper_name = "guardian-overlay-helper"
 resources_path = "overlay_resources"
 
 [dependencies]
-guardian_agent = { package = "guardian-agent-common", path = "../agent-common" }
+guardian_agent = { package = "guardian-agent-common", git = "https://github.com/Guardian-Parental-Controls/agent-common", tag = "v1.0.0" }
 tokio = { version = "1.35", features = ["full"] }
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
 serde = { version = "1.0", features = ["derive"] }
