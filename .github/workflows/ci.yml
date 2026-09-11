@@ -20,5 +20,10 @@ jobs:
             '[patch."https://github.com/Guardian-Parental-Controls/agent-common"]' \
             'guardian-agent-common = { path = "_agent-common" }' \
             > .cargo/config.toml
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libdbus-1-dev libssl-dev
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --lib
