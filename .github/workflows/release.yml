@@ -7,101 +7,126 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish (e.g. v1.0.0)"
+        description: "Release tag to build (for example v1.0.0)"
         required: true
-        default: "v1.0.0"
+        type: string
 
 permissions:
   contents: write
 
-env:
-  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build:
+  resolve:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - id: meta
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          TAG="${TAG#refs/tags/}"
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            artifact_id: linux-x86_64
-          - target: aarch64-unknown-linux-gnu
-            artifact_id: linux-aarch64
+          - arch_id: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            runs-on: ubuntu-latest
+          - arch_id: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
     steps:
-      - name: Check out agent-linux
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
         with:
-          ref: ${{ env.RELEASE_TAG }}
-
-      - name: Check out agent-common
-        uses: actions/checkout@v5
-        with:
-          repository: Guardian-Parental-Controls/agent-common
-          ref: ${{ env.RELEASE_TAG }}
-          path: _agent-common
-
-      - name: Use path patch for common
-        run: |
-          mkdir -p .cargo
-          printf '%s\n' \
-            '[patch."https://github.com/Guardian-Parental-Controls/agent-common"]' \
-            'guardian-agent-common = { path = "_agent-common" }' \
-            > .cargo/config.toml
+          ref: ${{ needs.resolve.outputs.tag }}
 
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libdbus-1-dev libssl-dev \
-            gcc-aarch64-linux-gnu
+            pkg-config libdbus-1-dev libssl-dev
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
-      - name: Build release binary
-        env:
-          GUARDIAN_AGENT_VERSION: ${{ env.RELEASE_TAG }}
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target "${{ matrix.target }}"
+      - name: Build guardian-agent
+        run: cargo build --release --bin guardian-agent
 
       - name: Package release archive
+        env:
+          TARGET_TRIPLE: ${{ matrix.target }}
         run: |
-          chmod +x scripts/package-linux-release.sh
-          scripts/package-linux-release.sh "${{ matrix.target }}" dist
+          set -euo pipefail
+          ARCHIVE="guardian-agent-${TARGET_TRIPLE}.tar.gz"
+          mkdir -p dist/stage
+          BIN="target/${TARGET_TRIPLE}/release/guardian-agent"
+          if [[ ! -f "${BIN}" ]]; then
+            BIN="target/release/guardian-agent"
+          fi
+          install -m 0755 "${BIN}" dist/stage/guardian-agent
+          tar -czf "dist/${ARCHIVE}" -C dist/stage guardian-agent
+          (
+            cd dist
+            sha256sum "${ARCHIVE}" | awk '{print $1}' > "${ARCHIVE}.sha256"
+          )
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_id }}
-          path: |
-            dist/guardian-agent-${{ matrix.target }}.tar.gz
-            dist/guardian-agent-${{ matrix.target }}.tar.gz.sha256
+          name: ${{ matrix.arch_id }}
+          path: dist/guardian-agent-*.tar.gz*
 
   publish:
-    needs: build
+    needs: [resolve, build]
     runs-on: ubuntu-latest
     steps:
-      - name: Download release assets
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
         with:
-          pattern: linux-*
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
           merge-multiple: true
-          path: dist
+
+      - name: Recreate empty immutable release (backfill)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.resolve.outputs.tag }}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            exit 0
+          fi
+          ASSETS="$(gh release view "$TAG" --json assets -q '.assets|length')"
+          IMMUTABLE="$(gh release view "$TAG" --json isImmutable -q .isImmutable)"
+          if [[ "$ASSETS" == "0" && "$IMMUTABLE" == "true" ]]; then
+            echo "Removing empty immutable release ${TAG} so binaries can be attached"
+            gh release delete "$TAG" --yes
+          fi
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: ${{ env.RELEASE_TAG }}
-          files: dist/*
-          fail_on_unmatched_files: true
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: ${{ needs.resolve.outputs.tag }}
+          generate_release_notes: true
+          files: artifacts/*
 
-      - name: Create versions automation token
-        if: secrets.GUARDIAN_VERSIONS_APP_ID != ''
-        id: versions-token
-        continue-on-error: true
+      - name: Create automation token
+        id: app-token
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.GUARDIAN_VERSIONS_APP_ID }}
@@ -109,40 +134,70 @@ jobs:
           owner: Guardian-Parental-Controls
           repositories: versions
 
-      - name: Publish agent-linux version
-        if: steps.versions-token.outcome == 'success'
+      - name: Publish versions feed component
         env:
-          GH_TOKEN: ${{ steps.versions-token.outputs.token }}
-          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          REPO: ${{ github.repository }}
         run: |
-          set -euo pipefail
-          version="${RELEASE_TAG#v}"
-          base="https://github.com/Guardian-Parental-Controls/agent-linux/releases/download/${RELEASE_TAG}"
-          gh api "repos/Guardian-Parental-Controls/versions/dispatches" \
-            --method POST \
-            --input - <<EOF
-          {
-            "event_type": "component-release",
-            "client_payload": {
+          python3 <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          tag = os.environ["TAG"]
+          version = os.environ["VERSION"]
+          owner_repo = os.environ["REPO"]
+          base = f"https://github.com/{owner_repo}/releases/download/{tag}"
+
+          artifacts = []
+          for arch_id, target in (
+              ("linux-x86_64", "x86_64-unknown-linux-gnu"),
+              ("linux-aarch64", "aarch64-unknown-linux-gnu"),
+          ):
+              name = f"guardian-agent-{target}.tar.gz"
+              artifacts.append(
+                  {
+                      "id": arch_id,
+                      "url": f"{base}/{name}",
+                      "checksum_url": f"{base}/{name}.sha256",
+                  }
+              )
+
+          checkout = subprocess.run(
+              [
+                  "gh",
+                  "api",
+                  "repos/Guardian-Parental-Controls/versions/contents/components/agent-linux.json",
+                  "--jq",
+                  ".content",
+              ],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          import base64
+
+          current = json.loads(
+              base64.b64decode(checkout.stdout).decode("utf-8")
+          )
+          payload = {
+              **current,
               "component": "agent-linux",
-              "version": "${version}",
-              "repository": "https://github.com/Guardian-Parental-Controls/agent-linux",
-              "minimum_supported_version": "1.0.0",
-              "min_server": "1.0.0",
-              "protocol_version": 1,
-              "install_script": "https://raw.githubusercontent.com/Guardian-Parental-Controls/agent-linux/${RELEASE_TAG}/scripts/install-agent.sh",
-              "artifacts": [
-                {
-                  "id": "linux-x86_64",
-                  "url": "${base}/guardian-agent-x86_64-unknown-linux-gnu.tar.gz",
-                  "checksum_url": "${base}/guardian-agent-x86_64-unknown-linux-gnu.tar.gz.sha256"
-                },
-                {
-                  "id": "linux-aarch64",
-                  "url": "${base}/guardian-agent-aarch64-unknown-linux-gnu.tar.gz",
-                  "checksum_url": "${base}/guardian-agent-aarch64-unknown-linux-gnu.tar.gz.sha256"
-                }
-              ]
-            }
+              "version": version,
+              "repository": f"https://github.com/{owner_repo}",
+              "artifacts": artifacts,
+              "install_script": (
+                  f"https://raw.githubusercontent.com/{owner_repo}/{tag}/scripts/install-agent.sh"
+              ),
           }
-          EOF
+
+          body = {
+              "event_type": "component-release",
+              "client_payload": payload,
+          }
+          Path("dispatch.json").write_text(json.dumps(body), encoding="utf-8")
+          PY
+          gh api --method POST repos/Guardian-Parental-Controls/versions/dispatches --input dispatch.json
