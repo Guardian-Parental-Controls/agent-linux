@@ -1,0 +1,280 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing git tag to build and publish (for example v1.0.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  resolve-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - name: Resolve release tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            tag="$INPUT_TAG"
+          else
+            tag="$REF_NAME"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag must look like vX.Y.Z, got: ${tag}" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+  linux-release-build:
+    needs: resolve-tag
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - name: Check out agent-linux
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+
+      - name: Check out agent-common
+        uses: actions/checkout@v5
+        with:
+          repository: Guardian-Parental-Controls/agent-common
+          ref: v1.0.0
+          path: _agent-common
+
+      - name: Use path patch for common
+        run: |
+          mkdir -p .cargo
+          printf '%s\n' \
+            '[patch."https://github.com/Guardian-Parental-Controls/agent-common"]' \
+            'guardian-agent-common = { path = "_agent-common" }' \
+            > .cargo/config.toml
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+            sudo python3 scripts/setup-cross-apt.py
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+              libdbus-1-dev:arm64 pkg-config
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends \
+              pkg-config libdbus-1-dev libssl-dev
+          fi
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-${{ matrix.target }}
+
+      - name: Build release binary
+        env:
+          GUARDIAN_AGENT_VERSION: ${{ needs.resolve-tag.outputs.tag }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            export PKG_CONFIG_ALLOW_CROSS=1
+            export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+          fi
+          cargo build --release --bin guardian-agent --target "${{ matrix.target }}"
+
+      - name: Package release asset
+        run: |
+          chmod +x scripts/package-linux-release.sh
+          ./scripts/package-linux-release.sh \
+            --binary "target/${{ matrix.target }}/release/guardian-agent" \
+            --name "guardian-agent-${{ matrix.target }}" \
+            --dist dist
+
+      - name: Upload packaged asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: guardian-linux-agent-${{ matrix.target }}
+          path: |
+            dist/guardian-agent-${{ matrix.target }}.tar.gz
+            dist/guardian-agent-${{ matrix.target }}.tar.gz.sha256
+
+  linux-cef-release-build:
+    needs: resolve-tag
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Check out agent-linux
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+
+      - name: Check out agent-common
+        uses: actions/checkout@v5
+        with:
+          repository: Guardian-Parental-Controls/agent-common
+          ref: v1.0.0
+          path: _agent-common
+
+      - name: Use path patch for common
+        run: |
+          mkdir -p .cargo
+          printf '%s\n' \
+            '[patch."https://github.com/Guardian-Parental-Controls/agent-common"]' \
+            'guardian-agent-common = { path = "_agent-common" }' \
+            > .cargo/config.toml
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libdbus-1-dev libssl-dev \
+            libx11-dev libxcomposite-dev libxcursor-dev libxdamage-dev \
+            libxext-dev libxfixes-dev libxi-dev libxrandr-dev libxrender-dev \
+            libxss-dev libxtst-dev \
+            libatk1.0-dev libatk-bridge2.0-dev libcups2-dev libdrm-dev \
+            libgbm-dev libnss3-dev
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-cef-overlay
+
+      - name: Cache CEF prebuilt download
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/cef
+          key: cef-prebuilt-v149-${{ runner.os }}
+
+      - name: Build guardian-overlay-helper
+        env:
+          GUARDIAN_AGENT_VERSION: ${{ needs.resolve-tag.outputs.tag }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          CEF_PATH: /home/runner/.local/share/cef
+        run: cargo build --release --bin guardian-overlay-helper --features cef-overlay
+
+      - name: Bundle CEF runtime
+        run: |
+          set -euo pipefail
+          export CEF_PATH="$HOME/.local/share/cef"
+          mkdir -p target/bundle
+          cp target/release/guardian-overlay-helper target/bundle/
+          if [[ -d "$CEF_PATH" ]]; then
+            cp -a "$CEF_PATH"/. target/bundle/
+          else
+            cef_dir="$(find target/release/build -name libcef.so -printf '%h\n' | head -1)"
+            [[ -n "$cef_dir" ]] || { echo "Could not locate libcef.so" >&2; exit 1; }
+            cp -a "${cef_dir}/." target/bundle/
+          fi
+
+      - name: Package overlay asset
+        run: |
+          chmod +x scripts/package-linux-release.sh
+          ./scripts/package-linux-release.sh \
+            --dir target/bundle \
+            --name guardian-overlay-x86_64-unknown-linux-gnu \
+            --dist dist
+
+      - name: Upload packaged asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: guardian-linux-overlay-x86_64
+          path: |
+            dist/guardian-overlay-x86_64-unknown-linux-gnu.tar.gz
+            dist/guardian-overlay-x86_64-unknown-linux-gnu.tar.gz.sha256
+
+  publish-release:
+    needs: [resolve-tag, linux-release-build, linux-cef-release-build]
+    if: >-
+      always() &&
+      needs.resolve-tag.result == 'success' &&
+      needs.linux-release-build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out agent-linux
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+
+      - name: Download linux agent assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: guardian-linux-agent-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download overlay asset
+        if: needs.linux-cef-release-build.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: guardian-linux-overlay-x86_64
+          path: dist
+
+      - name: Verify required artifacts
+        env:
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ls -la dist
+          python3 scripts/versions-payload.py --dist dist --tag "$TAG" --output /tmp/versions-dispatch.json
+          cat /tmp/versions-dispatch.json
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve-tag.outputs.tag }}
+          name: ${{ needs.resolve-tag.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*
+          fail_on_unmatched_files: true
+
+      - name: Create versions automation token
+        id: versions-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GUARDIAN_VERSIONS_APP_ID }}
+          private-key: ${{ secrets.GUARDIAN_VERSIONS_PRIVATE_KEY }}
+          owner: Guardian-Parental-Controls
+          repositories: versions
+
+      - name: Publish agent-linux version
+        if: steps.versions-token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.versions-token.outputs.token }}
+        run: |
+          gh api repos/Guardian-Parental-Controls/versions/dispatches \
+            --method POST \
+            --input /tmp/versions-dispatch.json

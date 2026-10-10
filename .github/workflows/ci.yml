@@ -4,6 +4,13 @@ on:
     branches: [main]
   pull_request:
 jobs:
+  release-helpers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Test release packaging helpers
+        run: python3 scripts/test_release_helpers.py
+
   test:
     runs-on: ubuntu-latest
     steps:
