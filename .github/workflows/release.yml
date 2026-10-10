@@ -70,8 +70,19 @@ jobs:
         env:
           TARGET_TRIPLE: ${{ matrix.target }}
         run: |
-          chmod +x scripts/package-release.sh
-          scripts/package-release.sh dist
+          set -euo pipefail
+          ARCHIVE="guardian-agent-${TARGET_TRIPLE}.tar.gz"
+          mkdir -p dist/stage
+          BIN="target/${TARGET_TRIPLE}/release/guardian-agent"
+          if [[ ! -f "${BIN}" ]]; then
+            BIN="target/release/guardian-agent"
+          fi
+          install -m 0755 "${BIN}" dist/stage/guardian-agent
+          tar -czf "dist/${ARCHIVE}" -C dist/stage guardian-agent
+          (
+            cd dist
+            sha256sum "${ARCHIVE}" | awk '{print $1}' > "${ARCHIVE}.sha256"
+          )
 
       - uses: actions/upload-artifact@v4
         with:
