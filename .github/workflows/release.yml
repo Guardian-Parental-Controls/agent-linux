@@ -131,7 +131,6 @@ jobs:
   linux-cef-release-build:
     needs: resolve-tag
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Check out agent-linux
         uses: actions/checkout@v5
